@@ -26,17 +26,36 @@ logger = logging.getLogger(__name__)
 
 
 def train(opt, model, criterion_disc, criterion_ce, optimizer, loader):
+    """
+    Training the network in one epoch
+
+    Args:
+        opt (Namspace): training options
+        model (LaneNet): a LaneNet model
+        criterion_disc: a DiscriminativeLoss criterion
+        criterion_ce: a CrossEntropyLoss criterion
+        optimizer: optimizer (SGD, Adam, etc)
+        loader: data loader
+
+    Returns:
+        None
+
+    """
+
     batch_time = AverageMeter()
     data_time = AverageMeter()
 
+    # switch to train mode
     model.train()
 
     end = time.time()
     pbar = tqdm(loader)
     for data in pbar:
+        # measure data loading time
         data_time.update(time.time() - end)
 
-        images, bin_labels, ins_labels, n_lanes = data
+#        images, bin_labels, ins_labels, n_lanes, pts  = data
+        images, bin_labels, ins_labels, n_lanes  = data
 
         images = Variable(images)
         bin_labels = Variable(bin_labels)
@@ -47,34 +66,39 @@ def train(opt, model, criterion_disc, criterion_ce, optimizer, loader):
             bin_labels = bin_labels.cuda()
             ins_labels = ins_labels.cuda()
             n_lanes = n_lanes.cuda()
+#            pts = pts.cuda()
 
         if torch.cuda.device_count() <= 1:
+#            bin_preds, ins_preds, hnet_preds = model(images)
             bin_preds, ins_preds = model(images)
         else:
+#            bin_preds, ins_preds, hnet_preds = gather(model(images), 0, dim=0)
             bin_preds, ins_preds = gather(model(images), 0, dim=0)
 
         _, bin_labels_ce = bin_labels.max(1)
         ce_loss = criterion_ce(
             bin_preds.permute(0, 2, 3, 1).contiguous().view(-1, 2),
             bin_labels_ce.view(-1))
-
+        # Skip if all instances are 0 (i.e., background only)
         if ins_labels.unique().numel() <= 1:
             print("All instance labels are zero, skipping discriminative loss")
-            disc_loss = torch.tensor(0.0, requires_grad=True, device=ins_preds.device)
+            disc_loss = torch.tensor(0.0, requires_grad=True).cuda()
         else:
             disc_loss = criterion_disc(ins_preds, ins_labels, n_lanes)
 
-        if torch.isnan(disc_loss):
-            print("disc_loss was NaN, replacing with 0")
-            disc_loss = torch.tensor(0.0, requires_grad=True, device=ins_preds.device)
 
+        disc_loss = criterion_disc(ins_preds, ins_labels, n_lanes)
+#        hnet_loss = compute_hnet_loss(pts, hnet_preds)
+#        loss = ce_loss + disc_loss + hnet_loss
         loss = ce_loss + disc_loss
-
         if torch.isnan(loss):
             print("NaN detected in loss")
             print("CE loss:", ce_loss.item())
             print("Disc loss:", disc_loss.item())
+            if 'hnet_loss' in locals():
+                print("HNet loss:", hnet_loss.item())
             exit()
+
 
         optimizer.zero_grad()
         loss.backward()
@@ -90,6 +114,21 @@ def train(opt, model, criterion_disc, criterion_ce, optimizer, loader):
 
 
 def test(opt, model, criterion_disc, criterion_ce, loader):
+    """
+    Validate the model at the current state
+
+    Args:
+        opt (Namspace): training options
+        model (LaneNet): a LaneNet model
+        criterion_disc: a DiscriminativeLoss criterion
+        criterion_ce: a CrossEntropyLoss criterion
+        loader: val data loader
+
+    Returns:
+        The average loss value on val data
+
+    """
+
     val_loss = AverageMeter()
     model.eval()
 
@@ -143,6 +182,8 @@ def test(opt, model, criterion_disc, criterion_ce, loader):
 
 
 def main(opt):
+
+    # Set the random seed manually for reproducibility.
     if torch.cuda.is_available():
         torch.cuda.manual_seed(opt.seed)
     else:
@@ -192,10 +233,23 @@ def main(opt):
         learning_rate = adjust_learning_rate(opt, optimizer, epoch)
         logger.info('===> Learning rate: %f: ', learning_rate)
 
-        train(opt, model, criterion_disc, criterion_ce, optimizer, train_loader)
+        # train for one epoch
+        train(
+            opt,
+            model,
+            criterion_disc,
+            criterion_ce,
+            optimizer,
+            train_loader)
 
+        # validate at every val_step epoch
         if epoch % opt.val_step == 0:
-            val_loss = test(opt, model, criterion_disc, criterion_ce, val_loader)
+            val_loss = test(
+                opt,
+                model,
+                criterion_disc,
+                criterion_ce,
+                val_loader)
             logger.info('Val loss: %s\n', val_loss)
 
             loss = val_loss.avg
@@ -228,39 +282,143 @@ def main(opt):
             break
 
 if __name__ == '__main__':
+
     parser = argparse.ArgumentParser()
 
-    parser.add_argument('meta_file', type=str, help='path to the metadata file containing train/val/test splits and image locations')
-    parser.add_argument('output_file', type=str, help='output model file (*.pth)')
-    parser.add_argument('--start_from', type=str, help='model to start from file (*.pth)')
-    parser.add_argument('--dataset', default='tusimple', choices=['tusimple', 'culane', 'bdd', 'iscwebots'], help='Name of dataset')
-    parser.add_argument('--image_dir', type=str, help='path to image dir')
-    parser.add_argument('--cnn_type', default='unet', choices=['unet', 'unetscnn', 'deeplab'], help='The CNN used for image encoder')
-    parser.add_argument('--embed_dim', type=int, default=4, help='Size of the lane embeddings')
-    parser.add_argument('--batch_size', type=int, default=4, help='batch size')
-    parser.add_argument('--width', type=int, default=512, help='image width to the network')
-    parser.add_argument('--height', type=int, default=256, help='image height to the network')
-    parser.add_argument('--loader_type', type=str, choices=['dataset', 'dirloader', 'tusimpletest'], default='dataset', help='data loader type, dir: from a directory; meta: from a metadata file')
-    parser.add_argument('--thickness', type=int, default=5, help='thickness of the polylines')
-    parser.add_argument('--max_lanes', type=int, default=5, help='max number of lanes')
-    parser.add_argument('--learning_rate', type=float, default=1e-4, help='learning rate')
-    parser.add_argument('--num_epochs', type=int, default=100, help='max number of epochs to run the training')
-    parser.add_argument('--lr_update', default=50, type=int, help='Number of epochs to update the learning rate.')
-    parser.add_argument('--max_patience', type=int, default=5, help='max number of epoch to run since the minima is detected -- early stopping')
-    parser.add_argument('--val_step', type=int, default=1, help='how often do we check the model (in terms of epoch)')
-    parser.add_argument('--num_workers', type=int, default=0, help='number of workers (each worker use a process to load a batch of data)')
-    parser.add_argument('--log_step', type=int, default=20, help='How often to print training info (loss, system/data time, etc)')
-    parser.add_argument('--use_hnet', action='store_true', help='Option to apply H-Net')
-    parser.add_argument('--seed', type=int, default=123, help='random number generator seed to use')
+    parser.add_argument(
+        'meta_file', type=str,
+        help='path to the metadata file containing train/val/test splits and image locations')
+
+    parser.add_argument(
+        'output_file',
+        type=str,
+        help='output model file (*.pth)')
+
+    parser.add_argument(
+        '--start_from',
+        type=str,
+        help='model to start from file (*.pth)')
+
+    parser.add_argument(
+        '--dataset',
+        default='tusimple',
+        choices=['tusimple', 'culane', 'bdd', 'iscwebots'],
+        help='Name of dataset')
+
+    parser.add_argument(
+        '--image_dir',
+        type=str,
+        help='path to image dir')
+
+    # Model settings
+    parser.add_argument(
+        '--cnn_type',
+        default='unet',
+        choices=['unet', 'unetscnn', 'deeplab'],
+        help='The CNN used for image encoder')
+
+    parser.add_argument(
+        '--embed_dim',
+        type=int,
+        default=4,
+        help='Size of the lane embeddings')
+
+    # Optimization
+    parser.add_argument(
+        '--batch_size',
+        type=int,
+        default=4,
+        help='batch size')
+
+    parser.add_argument(
+        '--width',
+        type=int,
+        default=512,
+        help='image width to the network')
+
+    parser.add_argument(
+        '--height',
+        type=int,
+        default=256,
+        help='image height to the network')
+
+    parser.add_argument(
+        '--loader_type',
+        type=str,
+        choices=['dataset', 'dirloader', 'tusimpletest'],
+        default='dataset',
+        help='data loader type, dir: from a directory; meta: from a metadata file')
+
+    parser.add_argument(
+        '--thickness',
+        type=int,
+        default=5,
+        help='thickness of the polylines')
+
+    parser.add_argument(
+        '--max_lanes',
+        type=int,
+        default=5,
+        help='max number of lanes')
+
+    parser.add_argument(
+        '--learning_rate',
+        type=float,
+        default=1e-4,
+        help='learning rate')
+
+    parser.add_argument(
+        '--num_epochs',
+        type=int,
+        default=100,
+        help='max number of epochs to run the training')
+    parser.add_argument('--lr_update', default=50, type=int,
+                        help='Number of epochs to update the learning rate.')
+
+    parser.add_argument(
+        '--max_patience', type=int, default=5,
+        help='max number of epoch to run since the minima is detected -- early stopping')
+
+    # other options
+    parser.add_argument(
+        '--val_step',
+        type=int,
+        default=1,
+        help='how often do we check the model (in terms of epoch)')
+
+    parser.add_argument(
+        '--num_workers', type=int, default=0,
+        help='number of workers (each worker use a process to load a batch of data)')
+
+    parser.add_argument(
+        '--log_step',
+        type=int,
+        default=20,
+        help='How often to print training info (loss, system/data time, etc)')
+
+    parser.add_argument(
+        '--use_hnet',
+        action='store_true',
+        help='Option to apply H-Net')
+
+    parser.add_argument(
+        '--seed',
+        type=int,
+        default=123,
+        help='random number generator seed to use')
 
     opt = parser.parse_args()
 
     logging.basicConfig(level=logging.DEBUG,
                         format='%(asctime)s:%(levelname)s: %(message)s')
 
-    logger.info('Input arguments: %s', json.dumps(vars(opt), sort_keys=True, indent=4))
+    logger.info(
+        'Input arguments: %s',
+        json.dumps(
+            vars(opt),
+            sort_keys=True,
+            indent=4))
 
     start = datetime.now()
     main(opt)
     logger.info('Time: %s', datetime.now() - start)
-
